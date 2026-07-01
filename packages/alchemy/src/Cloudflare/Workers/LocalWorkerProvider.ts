@@ -260,8 +260,19 @@ export const LocalWorkerProvider = () =>
         > = {};
         const hyperdrives: Record<string, Required<HyperdriveOrigin>> = {};
         const containers: Record<string, ContainerImage> = {};
+        const workflowClassNames = new Set<string>();
         for (const { data } of bindings) {
           for (const binding of data.bindings ?? []) {
+            if (
+              binding.type === "workflow" &&
+              binding.className &&
+              // Same-script workflows only — the dev module-runner needs the
+              // hosting worker to export the WorkflowEntrypoint class. A
+              // cross-script binding is handled by that other worker.
+              (!binding.scriptName || binding.scriptName === name)
+            ) {
+              workflowClassNames.add(binding.className);
+            }
             if (
               binding.type === "durable_object_namespace" &&
               // The `durableObjectNamespaces` property is only used to declare DOs in this worker.
@@ -328,6 +339,9 @@ export const LocalWorkerProvider = () =>
           compatibility,
           workerBindings,
           durableObjectNamespaces: Object.values(durableObjectNamespaces),
+          workflows: Array.from(workflowClassNames).map((className) => ({
+            className,
+          })),
           viteEnvironments: props.vite?.viteEnvironments,
           hyperdrives,
           env: props.env,
@@ -425,6 +439,7 @@ export const LocalWorkerProvider = () =>
               name: worker.name,
               bindings: worker.workerBindings,
               durableObjectNamespaces: worker.durableObjectNamespaces,
+              workflows: worker.workflows,
               hyperdrives: worker.hyperdrives,
               queueConsumers: yield* getQueueConsumers(worker.name),
               assets: toRuntimeAssets(worker.assets),
