@@ -478,6 +478,7 @@ export const LocalWorkerProvider = () =>
             ]),
           ),
           domains: [url],
+          routes: [],
           crons: Array.from(
             new Set([...getCronBindings(bindings), ...(props.crons ?? [])]),
           ),
@@ -545,6 +546,7 @@ export const LocalWorkerProvider = () =>
             tags: [],
             durableObjectNamespaces,
             domains: url ? [url] : [],
+            routes: [],
             crons: Array.from(
               new Set([...getCronBindings(bindings), ...(news.crons ?? [])]),
             ),
@@ -576,6 +578,7 @@ export const LocalWorkerProvider = () =>
               durableObjectNamespaces: {},
               accountId,
               domains: [],
+              routes: [],
               crons: news.crons ?? [],
             } satisfies Worker["Attributes"];
           }
