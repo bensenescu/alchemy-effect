@@ -705,12 +705,14 @@ export const providers = () =>
  * The retry policy extends `Retry.makeDefault`'s transient detection
  * (throttling / 5xx / network) with Cloudflare-specific
  * misleadingly-tagged transient cases the SDK doesn't yet mark
- * retryable — see `cloudflareRetryFactory` below. Deliberately
- * narrow: we ONLY add cases where the message unambiguously indicates
- * a transient infrastructure failure (not a real auth/permission
- * failure). Auto-retrying ambiguous cases like `Unauthorized:
- * Authentication error` would silently loop on genuinely invalid
- * tokens.
+ * retryable — see `cloudflareRetryFactory` below. Auth-flavored cases
+ * ("Authentication error", "Unable to authenticate request") are
+ * retried on a much tighter budget than other transients, and
+ * Cloudflare's auth-failure ban (429 code 10502) is never retried:
+ * each retry of a genuinely-failing credential is another failed
+ * authentication counted by Cloudflare's abuse guard, and once the
+ * ban trips, the whole session drowns in misleading "Rate limited"
+ * errors — see the predicates below for the full mechanics.
  *
  * TODO(distilled): once
  * https://github.com/alchemy-run/distilled/pull/233 lands, the retry
@@ -726,65 +728,156 @@ export const CloudflareApiLive = () =>
     Layer.provideMerge(Layer.succeed(Retry.Retry, cloudflareRetryFactory)),
   );
 
-const cloudflareRetryFactory: Retry.Factory = (lastError) => {
-  const defaults = Retry.makeDefault(lastError);
+/**
+ * Process-wide budget for retrying the auth-tagged misleadingly-transient
+ * cases ("Authentication error", "Unable to authenticate request"). Unlike
+ * other transient retries, each retry of a genuinely-failing credential is
+ * another failed authentication counted by Cloudflare's abuse guard, which
+ * bans the client — every subsequent request 429s with code 10502 "Too
+ * many authentication failures" — after a handful of consecutive failures
+ * (observed in the field: 5 failures tripped it).
+ *
+ * The budget is shared across ALL concurrent API calls (the CLI fans out
+ * several probes at startup, each with its own retry loop — per-call caps
+ * would multiply) and refills after a quiet window: at most
+ * {@link MAX_AUTH_ERROR_RETRIES} auth-error retries per
+ * {@link AUTH_RETRY_WINDOW_MS} across the process. That smooths the
+ * verified under-load flake while keeping retry-added failures well below
+ * the ban threshold. The unavoidable first attempt of each concurrent call
+ * also counts toward Cloudflare's guard, so a dead credential on a wide
+ * fan-out may still trip the ban — the fail-fast on code 10502 below is
+ * the backstop that keeps that from cascading.
+ */
+const MAX_AUTH_ERROR_RETRIES = 2;
+const AUTH_RETRY_WINDOW_MS = 30_000;
+
+/** @internal exported for tests */
+export interface AuthRetryBudget {
+  /** Consume one retry slot; `false` means the budget is exhausted. */
+  take(now?: number): boolean;
+}
+
+/** @internal exported for tests */
+export const makeAuthRetryBudget = (
+  maxRetries: number = MAX_AUTH_ERROR_RETRIES,
+  windowMs: number = AUTH_RETRY_WINDOW_MS,
+): AuthRetryBudget => {
+  let windowStart = 0;
+  let used = 0;
   return {
-    while: (error) =>
-      defaults.while?.(error) === true || isMisleadinglyTaggedTransient(error),
-    schedule: Schedule.max([
-      pipe(
-        Schedule.exponential(Duration.millis(250), 2),
-        Schedule.modifyDelay(
-          Effect.fn(function* ({ duration }) {
-            const error = yield* Ref.get(lastError);
-            // Throttling errors (429): honor a 500ms floor matching the
-            // distilled default.
-            const isThrottling =
-              (error as { _tag?: unknown })?._tag === "TooManyRequests";
-            if (isThrottling && Duration.toMillis(duration) < 500) {
-              return Duration.toMillis(Duration.millis(500));
-            }
-            return Duration.toMillis(duration);
-          }),
-        ),
-        Retry.capped(Duration.seconds(5)),
-        Retry.jittered,
-      ),
-      Schedule.recurs(8),
-    ]),
+    take: (now = Date.now()) => {
+      if (now - windowStart >= windowMs) {
+        windowStart = now;
+        used = 0;
+      }
+      return used++ < maxRetries;
+    },
   };
 };
 
-const isMisleadinglyTaggedTransient = (error: unknown): boolean => {
-  if (!error || typeof error !== "object") return false;
-  const tag = (error as { _tag?: unknown })._tag;
-  const message = ((error as { message?: unknown }).message ?? "") as string;
-  // CF code 10001: "Method not allowed for token" is a real permission
-  // failure (NOT retryable), but the same code is also returned with
-  // message "internal error" during Cloudflare-side hiccups. The two
-  // messages are unambiguously distinct, so we can safely retry only
-  // the internal-error variant.
-  if (tag === "Forbidden" && /internal error/i.test(message)) return true;
+const sharedAuthRetryBudget = makeAuthRetryBudget();
+
+/** @internal exported for tests */
+export const makeCloudflareRetryFactory =
+  (authRetryBudget: AuthRetryBudget): Retry.Factory =>
+  (lastError) => {
+    const defaults = Retry.makeDefault(lastError);
+    return {
+      while: (error) => {
+        // Cloudflare's auth-failure ban lasts minutes while this policy's
+        // capped backoff lasts seconds — retrying cannot outlast it, adds
+        // more banned-while-authenticating attempts, and masks the real
+        // problem (a failing credential) behind generic throttling errors.
+        // Fail fast so the accurate message surfaces.
+        if (isAuthFailureBan(error)) return false;
+        if (isMisleadinglyTaggedTransientAuth(error)) {
+          return authRetryBudget.take();
+        }
+        return (
+          defaults.while?.(error) === true ||
+          isMisleadinglyTaggedForbiddenInternalError(error)
+        );
+      },
+      schedule: Schedule.max([
+        pipe(
+          Schedule.exponential(Duration.millis(250), 2),
+          Schedule.modifyDelay(
+            Effect.fn(function* ({ duration }) {
+              const error = yield* Ref.get(lastError);
+              // Throttling errors (429): honor a 500ms floor matching the
+              // distilled default.
+              const isThrottling =
+                (error as { _tag?: unknown })?._tag === "TooManyRequests";
+              if (isThrottling && Duration.toMillis(duration) < 500) {
+                return Duration.toMillis(Duration.millis(500));
+              }
+              return Duration.toMillis(duration);
+            }),
+          ),
+          Retry.capped(Duration.seconds(5)),
+          Retry.jittered,
+        ),
+        Schedule.recurs(8),
+      ]),
+    };
+  };
+
+const cloudflareRetryFactory: Retry.Factory = makeCloudflareRetryFactory(
+  sharedAuthRetryBudget,
+);
+
+const tagAndMessage = (error: unknown): { tag: unknown; message: string } => {
+  if (!error || typeof error !== "object") {
+    return { tag: undefined, message: "" };
+  }
+  return {
+    tag: (error as { _tag?: unknown })._tag,
+    message: ((error as { message?: unknown }).message ?? "") as string,
+  };
+};
+
+/**
+ * CF code 10502: "Too many authentication failures. Please try again
+ * later." — Cloudflare's abuse guard tripped by repeated failed
+ * authentications, NOT ordinary throttling (code 10429). It arrives
+ * tagged `TooManyRequests`, so `Retry.makeDefault` would retry it like
+ * any 429; `cloudflareRetryFactory` instead fails fast on it.
+ */
+const isAuthFailureBan = (error: unknown): boolean => {
+  const { tag, message } = tagAndMessage(error);
+  return (
+    tag === "TooManyRequests" &&
+    /too many authentication failures/i.test(message)
+  );
+};
+
+/**
+ * Auth failures Cloudflare also emits transiently for valid credentials —
+ * retried, but only within the process-wide {@link makeAuthRetryBudget}
+ * budget, because with a genuinely bad credential every retry feeds
+ * Cloudflare's auth-failure ban (see {@link isAuthFailureBan}).
+ */
+const isMisleadinglyTaggedTransientAuth = (error: unknown): boolean => {
+  const { tag, message } = tagAndMessage(error);
   // CF code 10001: "Unable to authenticate request" intermittently 403s
   // otherwise-valid, long-lived credentials during Cloudflare-side auth/edge
   // blips — it is transient, not a real credential problem (a genuinely
   // invalid/expired token surfaces as `Unauthorized: Authentication error`,
-  // code 10000). The retry is bounded (see `cloudflareRetryFactory`), so even
-  // a persistent auth failure that somehow used this message would just fail
-  // fast after backoff rather than loop forever.
+  // code 10000).
   if (tag === "Forbidden" && /unable to authenticate request/i.test(message))
     return true;
-  // CF code 10000: "Authentication error" is a transient throttle Cloudflare
-  // returns under high request concurrency — the same call against the same
-  // zone succeeds in isolation (verified: an account whose zones are all
-  // active and reachable still intermittently rejects with "Authentication
-  // error" only when hundreds of calls fan out at once). It surfaces under
-  // both a 403 (`Forbidden`) and a 401 (`Unauthorized`) tag depending on the
-  // edge node. The retry is bounded (see `cloudflareRetryFactory`: ~8 tries,
-  // capped 5s), so a genuinely invalid/expired token — which produces the same
-  // message persistently — still fails fast after a few seconds of backoff
-  // rather than looping forever; the win is that valid tokens stop flaking
-  // under load.
+  // CF code 10000: "Authentication error" is ALSO returned transiently under
+  // high request concurrency — the same call against the same zone succeeds
+  // in isolation (verified: an account whose zones are all active and
+  // reachable still intermittently rejects with "Authentication error" only
+  // when hundreds of calls fan out at once). It surfaces under both a 403
+  // (`Forbidden`) and a 401 (`Unauthorized`) tag depending on the edge node.
+  // But the same message is what a genuinely invalid, expired, or
+  // IP-restricted token produces persistently (a token with client-IP
+  // filtering answers 401 code 10000 to every request from a disallowed
+  // address, only occasionally revealing 403 code 9109 "Cannot use the
+  // access token from location: …") — which is why retries are capped so
+  // tightly rather than merely bounded.
   if (
     (tag === "Forbidden" || tag === "Unauthorized") &&
     /authentication error/i.test(message)
@@ -792,4 +885,18 @@ const isMisleadinglyTaggedTransient = (error: unknown): boolean => {
     return true;
   }
   return false;
+};
+
+/**
+ * CF code 10001: "Method not allowed for token" is a real permission
+ * failure (NOT retryable), but the same code is also returned with
+ * message "internal error" during Cloudflare-side hiccups. The two
+ * messages are unambiguously distinct, so we can safely retry only
+ * the internal-error variant, on the normal transient budget.
+ */
+const isMisleadinglyTaggedForbiddenInternalError = (
+  error: unknown,
+): boolean => {
+  const { tag, message } = tagAndMessage(error);
+  return tag === "Forbidden" && /internal error/i.test(message);
 };
